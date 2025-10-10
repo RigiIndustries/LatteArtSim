@@ -1,0 +1,14 @@
+fileFormatVersion: 2
+guid: 4657692c2d41c1e48b5549a5fe801f85
+MonoImporter:
+  externalObjects: {}
+  serializedVersion: 2
+  defaultReferences:
+  - injectMat: {instanceID: 0}
+  - blurMat: {instanceID: 0}
+  - surfaceRenderer: {instanceID: 0}
+  executionOrder: 0
+  icon: {instanceID: 0}
+  userData: 
+  assetBundleName: 
+  assetBundleVariant: 

@@ -1,0 +1,35 @@
+# --- Unity ---
+[Ll]ibrary/
+[Tt]emp/
+[Oo]bj/
+[Bb]uild*/
+[Ll]ogs/
+[Mm]emoryCaptures/
+[Rr]ecords/
+Assets/AssetStoreTools*
+UserSettings/**/Layouts/
+
+# --- Unity packages cache ---
+Packages/PackageCache/
+
+# --- IDE / tooling ---
+.vs/
+.vscode/*
+!.vscode/extensions.json
+!.vscode/settings.json
+!.vscode/launch.json
+.idea/
+*.csproj
+*.sln
+*.user
+*.pidb
+*.suo
+*.svd
+*.userprefs
+
+# --- Misc ---
+*.tmp
+*.bak
+*.swp
+.DS_Store
+Thumbs.db

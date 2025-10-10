@@ -1,0 +1,277 @@
+﻿#pragma kernel Splat
+#pragma kernel Advect
+#pragma kernel AdvectDye
+#pragma kernel DiffuseVel
+#pragma kernel ComputeDiv
+#pragma kernel JacobiPressure
+#pragma kernel SubtractGrad
+#pragma kernel Boundary
+#pragma kernel TestFill
+
+#define THREADS 8
+
+// --- RW targets (writes) ---
+RWTexture2D<float2> VelWrite;
+RWTexture2D<float4> DyeWrite;
+RWTexture2D<float>  PressureWrite;
+
+// --- SRV inputs (reads) ---
+Texture2D<float2> VelRead;
+Texture2D<float4> DyeRead;
+Texture2D<float>  PressureRead;
+Texture2D<float>  Divergence;
+Texture2D<float2> Vel0;               // for diffusion reference
+
+// --- Globals ---
+float2 GridSize;                      // (W,H)
+float  Texel;                         // 1/W (assuming square cells)
+float  dt;                            // timestep
+float  viscosity;                     // velocity diffusion coeff
+float  dyeDissipation;                // per-second fade
+
+// Splat params
+float2 splatUV;
+float  splatRadius;
+float  splatHardness;                 // 0..1 (1 = hard)
+float  splatAmount;                   // 0..1
+float2 splatForce;
+
+// Pressure solve
+float  jacobiAlpha;                   // -1
+float  jacobiBeta;                    // 4
+
+// --- Helpers ---
+int2 Dim() { return int2(GridSize + 0.5); }
+bool InBounds(int2 p) { int2 d = Dim(); return (p.x >= 0 && p.y >= 0 && p.x < d.x&& p.y < d.y); }
+
+int2 ClampCoord(int2 c) {
+    int2 d = Dim();
+    c.x = clamp(c.x, 0, d.x - 1);
+    c.y = clamp(c.y, 0, d.y - 1);
+    return c;
+}
+
+float2 readVel(int2 p) { return VelRead.Load(int3(ClampCoord(p), 0)); }
+float4 readDye(int2 p) { return DyeRead.Load(int3(ClampCoord(p), 0)); }
+float  readP(int2 p) { return PressureRead.Load(int3(ClampCoord(p), 0)); }
+
+// Soft circle mask with hardness
+float circleMask(float2 uv, float2 c, float r, float h) {
+    float d = distance(uv, c);
+    float t = saturate(1.0 - d / max(r, 1e-6));
+    // hardness maps 0..1 to exponent 4..1 (softer to harder)
+    return pow(t, lerp(4.0, 1.0, saturate(h)));
+}
+
+// Bilinear sample of velocity at UV (0..1), clamped so the 4-tap neighborhood is valid
+float2 bilerpVel(float2 uv) {
+    float2 wh = GridSize;
+    float2 minUV = float2(0.5 / wh.x, 0.5 / wh.y);
+    float2 maxUV = float2(1.0 - 1.5 / wh.x, 1.0 - 1.5 / wh.y);
+    float2 tUV = clamp(uv, minUV, maxUV);
+
+    float2 xy = tUV * wh - 0.5;
+    float2 i = floor(xy);
+    float2 f = xy - i;
+
+    int2 i00 = int2(i);
+    int2 i10 = i00 + int2(1, 0);
+    int2 i01 = i00 + int2(0, 1);
+    int2 i11 = i00 + int2(1, 1);
+
+    float2 a = readVel(i00);
+    float2 b = readVel(i10);
+    float2 c = readVel(i01);
+    float2 d = readVel(i11);
+
+    float2 ab = lerp(a, b, f.x);
+    float2 cd = lerp(c, d, f.x);
+    return lerp(ab, cd, f.y);
+}
+
+// Bilinear sample of dye
+float4 bilerpDye(float2 uv) {
+    float2 wh = GridSize;
+    float2 minUV = float2(0.5 / wh.x, 0.5 / wh.y);
+    float2 maxUV = float2(1.0 - 1.5 / wh.x, 1.0 - 1.5 / wh.y);
+    float2 tUV = clamp(uv, minUV, maxUV);
+
+    float2 xy = tUV * wh - 0.5;
+    float2 i = floor(xy);
+    float2 f = xy - i;
+
+    int2 i00 = int2(i);
+    int2 i10 = i00 + int2(1, 0);
+    int2 i01 = i00 + int2(0, 1);
+    int2 i11 = i00 + int2(1, 1);
+
+    float4 a = DyeRead.Load(int3(ClampCoord(i00), 0));
+    float4 b = DyeRead.Load(int3(ClampCoord(i10), 0));
+    float4 c = DyeRead.Load(int3(ClampCoord(i01), 0));
+    float4 d = DyeRead.Load(int3(ClampCoord(i11), 0));
+
+    float4 ab = lerp(a, b, f.x);
+    float4 cd = lerp(c, d, f.x);
+    return lerp(ab, cd, f.y);
+}
+
+// Backtrace helper
+float2 backtrace(float2 uv) {
+    float2 v = bilerpVel(uv);
+    return uv - v * dt; // semi-Lagrangian
+}
+
+// --- Kernels ---
+
+// Quick visual test (writes a soft circle to dye)
+[numthreads(THREADS, THREADS, 1)]
+void TestFill(uint3 id : SV_DispatchThreadID)
+{
+    int2 p = int2(id.xy);
+    if (!InBounds(p)) return;
+
+    float2 uv = (p + 0.5) / GridSize;
+    float2 c = float2(0.5, 0.5);
+    float  r = 0.35;
+    float  m = smoothstep(r, r - 0.01, distance(uv, c));
+    DyeWrite[p] = float4(m, m, m, 1);
+}
+
+[numthreads(THREADS, THREADS, 1)]
+void Splat(uint3 id : SV_DispatchThreadID)
+{
+    int2 p = int2(id.xy);
+    if (!InBounds(p)) return;
+
+    float2 uv = (p + 0.5) / GridSize;
+    float  m = circleMask(uv, splatUV, splatRadius, splatHardness) * splatAmount;
+
+    // Add white dye
+    float4 c = readDye(p);
+    c.rgb = saturate(c.rgb + m.xxx);  // add equally to RGB
+    c.a = 1.0;
+    DyeWrite[p] = c;
+
+    // Add force to velocity
+    float2 v = readVel(p);
+    v += splatForce * m;
+    VelWrite[p] = v;
+}
+
+[numthreads(THREADS, THREADS, 1)]
+void Advect(uint3 id : SV_DispatchThreadID)
+{
+    int2 p = int2(id.xy);
+    if (!InBounds(p)) return;
+
+    float2 uv = (p + 0.5) / GridSize;
+    float2 prevUV = backtrace(uv);
+    float2 v = bilerpVel(prevUV);
+    VelWrite[p] = v;
+}
+
+[numthreads(THREADS, THREADS, 1)]
+void AdvectDye(uint3 id : SV_DispatchThreadID)
+{
+    int2 p = int2(id.xy);
+    if (!InBounds(p)) return;
+
+    float2 uv = (p + 0.5) / GridSize;
+    float2 prevUV = backtrace(uv);
+    float4 c = bilerpDye(prevUV);
+
+    // simple exponential fade: c *= exp(-k*dt)
+    float fade = exp(-saturate(dyeDissipation) * dt);
+    c.rgb *= fade;
+    c.a = 1.0;
+
+    DyeWrite[p] = c;
+}
+
+[numthreads(THREADS, THREADS, 1)]
+void DiffuseVel(uint3 id : SV_DispatchThreadID)
+{
+    int2 p = int2(id.xy);
+    if (!InBounds(p)) return;
+
+    // Jacobi for diffusion: (I - ν dt ∇²) v = v0
+    float a = viscosity * dt;
+    float2 v0 = Vel0.Load(int3(ClampCoord(p), 0));
+
+    float2 vL = readVel(p + int2(-1, 0));
+    float2 vR = readVel(p + int2(1, 0));
+    float2 vB = readVel(p + int2(0, -1));
+    float2 vT = readVel(p + int2(0, 1));
+    float2 sumNbr = vL + vR + vB + vT;
+
+    float denom = 1.0 + 4.0 * a;
+    float2 v = (v0 + a * sumNbr) / denom;
+
+    VelWrite[p] = v;
+}
+
+[numthreads(THREADS, THREADS, 1)]
+void ComputeDiv(uint3 id : SV_DispatchThreadID)
+{
+    int2 p = int2(id.xy);
+    if (!InBounds(p)) return;
+
+    // Forward/back difference, assuming unit grid spacing
+    float2 vL = readVel(p + int2(-1, 0));
+    float2 vR = readVel(p + int2(1, 0));
+    float2 vB = readVel(p + int2(0, -1));
+    float2 vT = readVel(p + int2(0, 1));
+
+    float div = 0.5 * ((vR.x - vL.x) + (vT.y - vB.y));
+    PressureWrite[p] = div;
+}
+
+[numthreads(THREADS, THREADS, 1)]
+void JacobiPressure(uint3 id : SV_DispatchThreadID)
+{
+    int2 p = int2(id.xy);
+    if (!InBounds(p)) return;
+
+    float pL = readP(p + int2(-1, 0));
+    float pR = readP(p + int2(1, 0));
+    float pB = readP(p + int2(0, -1));
+    float pT = readP(p + int2(0, 1));
+    float b = Divergence.Load(int3(ClampCoord(p), 0));
+
+    float sumNbr = pL + pR + pB + pT;
+    // Standard Jacobi: x' = (b - alpha * sumNbr) / beta, with alpha=-1, beta=4
+    float x = (b - jacobiAlpha * sumNbr) / jacobiBeta;
+
+    PressureWrite[p] = x;
+}
+
+[numthreads(THREADS, THREADS, 1)]
+void SubtractGrad(uint3 id : SV_DispatchThreadID)
+{
+    int2 p = int2(id.xy);
+    if (!InBounds(p)) return;
+
+    float pL = readP(p + int2(-1, 0));
+    float pR = readP(p + int2(1, 0));
+    float pB = readP(p + int2(0, -1));
+    float pT = readP(p + int2(0, 1));
+
+    float2 v = readVel(p);
+    float2 gradP = 0.5 * float2(pR - pL, pT - pB);
+    v -= gradP;
+    VelWrite[p] = v;
+}
+
+[numthreads(THREADS, THREADS, 1)]
+void Boundary(uint3 id : SV_DispatchThreadID)
+{
+    int2 p = int2(id.xy);
+    if (!InBounds(p)) return;
+
+    int2 d = Dim();
+    if (p.x == 0 || p.y == 0 || p.x == d.x - 1 || p.y == d.y - 1)
+    {
+        VelWrite[p] = float2(0, 0);
+        PressureWrite[p] = 0;
+    }
+}
