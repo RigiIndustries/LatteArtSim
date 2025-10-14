@@ -3,80 +3,106 @@
 public class MousePourInput : MonoBehaviour
 {
     [Header("Refs")]
-    public LatteSimCompute sim;       // assign the compute sim
-    public Camera cam;
-    public Collider surfaceCollider;
+    public LatteSimCompute sim;       // Assign the compute sim
+    public Camera cam;                // Camera used for raycasts
+    public Collider surfaceCollider;  // Optional: restrict hits to this collider
 
     [Header("Brush")]
+    [Tooltip("When ON, brush radius/hardness/amount come from LatteSimCompute inspector (Splat Defaults).")]
+    public bool useSimDefaults = true;
+
     [Range(0.01f, 0.25f)] public float radius = 0.08f;
     [Range(0f, 1f)] public float hardness = 0.85f;
     [Range(0f, 1f)] public float amount = 0.25f;
+
     [Tooltip("Spacing as a fraction of radius (lower = denser splats).")]
     [Range(0.05f, 1f)] public float spacing = 0.25f;
 
-    [Header("Forces")]
-    [Tooltip("Scales stroke velocity (UV/sec) before injecting as force.")]
-    public float flowMultiplier = 6f;
-
-    [Header("Hotkeys")]
+    [Header("Input")]
+    public int mouseButton = 0;       // 0 = LMB
     public KeyCode clearKey = KeyCode.C;
 
-    Vector2? lastUV;
+    // State
+    Vector2? lastUV = null;
     float lastTime;
 
-    void Awake()
+    void Reset()
     {
         if (!cam) cam = Camera.main;
     }
-
-    void OnDisable() { lastUV = null; }
 
     void Update()
     {
         if (!sim || !cam) return;
 
-        if (Input.GetKeyDown(clearKey)) sim.Clear();
-
-        if (Input.GetMouseButtonDown(0))
+        // Optional: quick clear
+        if (Input.GetKeyDown(clearKey))
         {
-            lastUV = null;
-            lastTime = Time.time;
+            sim.Clear();
         }
 
-        if (!Input.GetMouseButton(0)) return;
-        if (!RaycastUV(Input.mousePosition, out var uv)) return;
+        bool down = Input.GetMouseButtonDown(mouseButton);
+        bool held = Input.GetMouseButton(mouseButton);
+        bool up   = Input.GetMouseButtonUp(mouseButton);
 
-        if (lastUV == null)
+        if (down)
         {
-            lastUV = uv;
-            lastTime = Time.time;
-            // first tap: deposit a bit, no push
-            sim.InjectUV(uv, radius, hardness, amount, Vector2.zero);
+            if (RaycastUV(Input.mousePosition, out var uv))
+            {
+                // Choose brush source once per stroke
+                var r = useSimDefaults ? sim.defaultRadius   : radius;
+                var h = useSimDefaults ? sim.defaultHardness : hardness;
+                var a = useSimDefaults ? sim.defaultAmount   : amount;
+
+                // First tap: deposit with no push
+                sim.InjectUV(uv, r, h, a, Vector2.zero);
+
+                lastUV = uv;
+                lastTime = Time.time;
+            }
             return;
         }
 
-        // Frame-wise stroke info
-        Vector2 prevUV = lastUV.Value;
-        float dt = Mathf.Max(Time.time - lastTime, 1e-4f);
-        Vector2 strokeVelUV = (uv - prevUV) / dt;  // UV/sec, used for ALL sub-splats this frame
-
-        // Place sub-splats along the segment
-        float dist = Vector2.Distance(prevUV, uv);
-        float step = Mathf.Max(0.001f, radius * spacing);
-        int steps = Mathf.Max(1, Mathf.CeilToInt(dist / step));
-
-        float amtPerStep = amount / steps;                 // don’t over-deposit color
-        Vector2 forcePerStep = strokeVelUV * flowMultiplier; // constant force per frame
-
-        for (int i = 1; i <= steps; i++)
+        if (held && lastUV.HasValue)
         {
-            float t = i / (float)steps;
-            Vector2 p = Vector2.Lerp(prevUV, uv, t);
-            sim.InjectUV(p, radius, hardness, amtPerStep, forcePerStep);
+            if (!RaycastUV(Input.mousePosition, out var uv))
+                return;
+
+            // Brush parameters (consistent for the whole frame)
+            var r = useSimDefaults ? sim.defaultRadius   : radius;
+            var h = useSimDefaults ? sim.defaultHardness : hardness;
+            var a = useSimDefaults ? sim.defaultAmount   : amount;
+
+            // Frame-wise stroke info
+            Vector2 prevUV = lastUV.Value;
+            float dt = Mathf.Max(Time.time - lastTime, 1e-4f);
+            Vector2 strokeVelUV = (uv - prevUV) / dt;  // UV/sec, used for all sub-splats
+
+            // Place sub-splats along the segment
+            float dist = Vector2.Distance(prevUV, uv);
+            float step = Mathf.Max(0.001f, r * spacing);
+            int steps = Mathf.Max(1, Mathf.CeilToInt(dist / step));
+
+            float amtPerStep = a / steps; // keep total deposit ≈ a
+
+            for (int i = 1; i <= steps; i++)
+            {
+                float t = (float)i / steps;
+                Vector2 p = Vector2.Lerp(prevUV, uv, t);
+
+                // Each sub-splat: small amount + same velocity push
+                sim.InjectUV(p, r, h, amtPerStep, strokeVelUV);
+            }
+
+            lastUV = uv;
+            lastTime = Time.time;
+            return;
         }
 
-        lastUV = uv;
-        lastTime = Time.time;
+        if (up)
+        {
+            lastUV = null;
+        }
     }
 
     bool RaycastUV(Vector3 screen, out Vector2 uv)
