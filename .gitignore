@@ -33,3 +33,34 @@ Packages/PackageCache/
 *.swp
 .DS_Store
 Thumbs.db
+.vsconfig
+.vscode/extensions.json
+.vscode/launch.json
+.vscode/settings.json
+
+# --- Meta / Oculus / Quest specific ---
+Assets/Oculus/
+Assets/MetaXR/
+Assets/XR/
+Assets/Plugins/Android/
+Assets/Plugins/iOS/
+Assets/StreamingAssets/Oculus/
+Assets/StreamingAssets/MetaXR/
+Assets/StreamingAssets/XR/
+Builds/
+*.apk
+*.aab
+*.obb
+.gradle/
+
+# --- Android / Quest build artifacts ---
+*.apk
+*.aab
+*.obb
+.gradle/
+**/.gradle/
+
+# --- Unity Burst (generated per-build, not settings) ---
+**/*_BurstDebugInformation_DoNotShip*/
+**/tempburstlibs/
+**/lib_burst_generated.txt

@@ -8,4 +8,12 @@ EditorBuildSettings:
   - enabled: 1
     path: Assets/Scenes/LatteArtSim.unity
     guid: 99c9720ab356a0642a771bea13969a05
-  m_configObjects: {}
+  m_configObjects:
+    Unity.XR.Oculus.Settings: {fileID: 11400000, guid: 8abce3017537ce8408c03d087bc8b22f,
+      type: 2}
+    com.unity.xr.arfoundation.simulation_settings: {fileID: 11400000, guid: 2e2a3f0aef9590b46b13847af76a200e,
+      type: 2}
+    com.unity.xr.management.loader_settings: {fileID: 11400000, guid: 768b81edf0940b846b49c27074a0fb87,
+      type: 2}
+    com.unity.xr.openxr.settings4: {fileID: 11400000, guid: c2c381138c318254c83c973ff098210d,
+      type: 2}
