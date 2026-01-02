@@ -1,270 +1,277 @@
 ﻿using UnityEngine;
 
+/// <summary>
+/// Main Latte-Art-Sim controller. Manages Lattefluid shader.
+/// GPU-based 2D fluid + dye simulation for latte surface.
+/// Manages render textures (ping-pong) and dispatches compute kernels each frame.
+/// </summary>
 public class LatteSimCompute : MonoBehaviour
 {
-    [Header("Debug")]
-    public bool autoSplat = false;
-    public bool runComputeSelfTest;  // tick once in Play Mode
-    public bool runCpuWhiteFill;     // tick once in Play Mode
-    int testFillKernel;
-
-    [Tooltip("Ceiling for incoming force (UV/sec).")]
-    public float forceMaxUVPerSec = 2.0f;
-
-
-    [Header("Refs")]
-    public MeshRenderer surfaceRenderer;   // SurfaceDisk
-    public MeshRenderer debugRenderer;     // optional small quad
+    [Header("State")]
+    [Tooltip("Master toggle for simulation step.")]
+    public bool simEnabled = true;
 
     [Header("Compute")]
-    public ComputeShader fluid;            // LatteFluid.compute
+    [Tooltip("Compute shader implementing the fluid + dye kernels.")]
+    public ComputeShader fluid;
+
+    [Header("Refs")]
+    [Tooltip("Renderer of the cup surface mesh; receives dye texture.")]
+    public MeshRenderer surfaceRenderer;
+
+    [Tooltip("Optional debug quad/mesh to preview the dye texture.")]
+    public MeshRenderer debugRenderer;
 
     [Header("Grid")]
+    [Tooltip("Simulation resolution (square). Higher = sharper but more expensive.")]
     [Range(128, 2048)] public int resolution = 1024;
 
     [Header("Sim Params")]
+    [Tooltip("Fixed simulation timestep (seconds).")]
     public float timestep = 1f / 60f;
-    [Tooltip("Velocity diffusion. Lower = livelier. 0.0003–0.001 typical.")]
+
+    [Tooltip("Velocity diffusion coefficient. Lower = livelier, higher = more viscous.")]
     public float viscosity = 0.0005f;
-    [Tooltip("Dye fade per second. 0.1–0.5 typical.")]
+
+    [Tooltip("Dye fade per second. Higher = pattern disappears faster.")]
     public float dyeDissipation = 0.3f;
-    [Tooltip("Pressure iterations per frame (30–80 typical).")]
+
+    [Tooltip("Pressure solver iterations. Higher = less compressible, more stable (slower).")]
     [Range(1, 200)] public int pressureIters = 40;
-    [Tooltip("Jacobi passes for Velocity diffusion (0–20).")]
+
+    [Tooltip("Velocity diffusion iterations (not used in the current Step path, kept for future).")]
     [Range(0, 60)] public int velDiffuseIters = 10;
 
     [Header("Splat Defaults")]
-    public float defaultRadius = 0.06f;           // UV units
+    [Tooltip("Default splat radius in UV units.")]
+    public float defaultRadius = 0.06f;
+
     [Range(0, 1)] public float defaultHardness = 0.85f;
     [Range(0, 1)] public float defaultAmount = 0.25f;
-    public float splatForceScale = 4.0f;          // scales incoming force
 
-    // internals
-    RenderTexture velA, velB, dyeA, dyeB, pA, pB, div;
-    int kSplat, kAdvect, kAdvectDye, kDiffuseVel, kDiv, kJacobi, kSubtract, kBoundary;
+    [Tooltip("Scales incoming flowDir into velocity impulse.")]
+    public float splatForceScale = 4.0f;
+
+    [Header("Input Limits")]
+    [Tooltip("Clamp incoming force magnitude (UV/sec). Prevents unstable impulses.")]
+    public float forceMaxUVPerSec = 2.0f;
+
+    // Ping-pong simulation targets
+    RenderTexture velA, velB;
+    RenderTexture dyeA, dyeB;
+    RenderTexture pA, pB;
+    RenderTexture div;
+
+    // Cached kernel indices
+    int kSplat, kAdvect, kAdvectDye, kDiv, kJacobi, kSubtract;
+    int kDiffuseVel, kBoundary; // cached but not used in current Step
+
+    // Dispatch group sizes (based on compute THREADS = 8)
     int tgx, tgy;
 
-    // IDs
-    static readonly int _VelWrite = Shader.PropertyToID("VelWrite");
-    static readonly int _VelRead = Shader.PropertyToID("VelRead");
-    static readonly int _DyeWrite = Shader.PropertyToID("DyeWrite");
-    static readonly int _DyeRead = Shader.PropertyToID("DyeRead");
-    static readonly int _PressureWrite = Shader.PropertyToID("PressureWrite");
-    static readonly int _PressureRead = Shader.PropertyToID("PressureRead");
-    static readonly int _Divergence = Shader.PropertyToID("Divergence");
-    static readonly int _GridSize = Shader.PropertyToID("GridSize");
-    static readonly int _Texel = Shader.PropertyToID("Texel");
-    static readonly int _dt = Shader.PropertyToID("dt");
-    static readonly int _viscosity = Shader.PropertyToID("viscosity");
-    static readonly int _dyeDiss = Shader.PropertyToID("dyeDissipation");
-    static readonly int _splatUV = Shader.PropertyToID("splatUV");
-    static readonly int _splatRadius = Shader.PropertyToID("splatRadius");
-    static readonly int _splatHardness = Shader.PropertyToID("splatHardness");
-    static readonly int _splatAmount = Shader.PropertyToID("splatAmount");
-    static readonly int _splatForce = Shader.PropertyToID("splatForce");
-    static readonly int _Vel0 = Shader.PropertyToID("Vel0");
-    static readonly int _jacobiAlpha = Shader.PropertyToID("jacobiAlpha");
-    static readonly int _jacobiBeta = Shader.PropertyToID("jacobiBeta");
+    // Shader property IDs (avoid string lookups every frame)
+    static readonly int ID_GridSize      = Shader.PropertyToID("GridSize");
+    static readonly int ID_Texel         = Shader.PropertyToID("Texel");
+    static readonly int ID_dt            = Shader.PropertyToID("dt");
+    static readonly int ID_viscosity     = Shader.PropertyToID("viscosity");
+    static readonly int ID_dyeDiss       = Shader.PropertyToID("dyeDissipation");
+
+    static readonly int ID_splatUV       = Shader.PropertyToID("splatUV");
+    static readonly int ID_splatRadius   = Shader.PropertyToID("splatRadius");
+    static readonly int ID_splatHardness = Shader.PropertyToID("splatHardness");
+    static readonly int ID_splatAmount   = Shader.PropertyToID("splatAmount");
+    static readonly int ID_splatForce    = Shader.PropertyToID("splatForce");
+
+    MaterialPropertyBlock _mpb;
 
     void Awake()
     {
+        // Hard fail early if compute shader is missing: avoids null spam and partial state.
+        if (!fluid)
+        {
+            enabled = false;
+            return;
+        }
+
         Allocate();
         CacheKernels();
-
-        Debug.Log("LatteSimCompute.Awake()");
-        Debug.Log("supportsComputeShaders=" + SystemInfo.supportsComputeShaders);
-
-        if (!fluid) Debug.LogError("LatteSimCompute: Fluid (ComputeShader) is NOT assigned!");
-
-        void CK(int id, string n) { if (id < 0) Debug.LogError("Kernel not found: " + n); else Debug.Log("Kernel OK: " + n + " = " + id); }
-        CK(kSplat, "Splat"); CK(kAdvect, "Advect"); CK(kAdvectDye, "AdvectDye");
-        CK(kDiffuseVel, "DiffuseVel"); CK(kDiv, "ComputeDiv");
-        CK(kJacobi, "JacobiPressure"); CK(kSubtract, "SubtractGrad"); CK(kBoundary, "Boundary");
-
-        // Test kernel
-        testFillKernel = fluid.FindKernel("TestFill");
-        CK(testFillKernel, "TestFill");
-
-
-
-        BindGlobals();
         BindSurface();
     }
 
-    void OnDestroy() => ReleaseAll();
+    void OnDestroy()
+    {
+        ReleaseAll();
+    }
 
     void Update()
     {
-        if (runComputeSelfTest)
-        {
-            runComputeSelfTest = false;
-            Debug.Log("Dispatching TestFill...");
-            BindGlobals();
-            fluid.SetTexture(testFillKernel, "DyeWrite", dyeA);
-            int gx = Mathf.CeilToInt(resolution / 8f);
-            int gy = Mathf.CeilToInt(resolution / 8f);
-            fluid.Dispatch(testFillKernel, gx, gy, 1);
-            BindSurface();
-        }
-
-        if (runCpuWhiteFill)
-        {
-            runCpuWhiteFill = false;
-            Debug.Log("CPU white fill...");
-            var prev = RenderTexture.active;
-            RenderTexture.active = dyeA;
-            GL.Clear(false, true, Color.white);
-            RenderTexture.active = prev;
-            BindSurface();
-        }
-
-
+        if (!simEnabled || !fluid)
+            return;
 
         Step(timestep);
-        if (debugRenderer) debugRenderer.material.mainTexture = dyeA;
+
+        // Optional: easy runtime preview on a debug quad without touching MPBs.
+        if (debugRenderer)
+            debugRenderer.material.mainTexture = dyeA;
     }
 
-    // ---------------- public API ----------------
+    // ---------------- Public API ----------------
 
+    /// <summary>
+    /// Injects dye only (no velocity impulse).
+    /// </summary>
     public void InjectUV(Vector2 uv, float radius, float hardness, float amount)
     {
-        Splat(uv,
-              radius <= 0 ? defaultRadius : radius,
-              hardness <= 0 ? defaultHardness : hardness,
-              amount <= 0 ? defaultAmount : amount,
-              Vector2.zero);
+        Splat(
+            uv,
+            radius <= 0 ? defaultRadius : radius,
+            hardness <= 0 ? defaultHardness : hardness,
+            amount <= 0 ? defaultAmount : amount,
+            Vector2.zero
+        );
     }
 
+    /// <summary>
+    /// Injects dye and velocity impulse (flowDirUV in UV/sec).
+    /// </summary>
     public void InjectUV(Vector2 uv, float radius, float hardness, float amount, Vector2 flowDirUV)
     {
-        // clamp force
-        if (flowDirUV.sqrMagnitude > forceMaxUVPerSec * forceMaxUVPerSec)
-            flowDirUV = flowDirUV.normalized * forceMaxUVPerSec;
+        flowDirUV = ClampForce(flowDirUV);
 
-        Splat(uv,
-              radius <= 0 ? defaultRadius : radius,
-              hardness <= 0 ? defaultHardness : hardness,
-              amount <= 0 ? defaultAmount : amount,
-              flowDirUV * splatForceScale);
+        Splat(
+            uv,
+            radius <= 0 ? defaultRadius : radius,
+            hardness <= 0 ? defaultHardness : hardness,
+            amount <= 0 ? defaultAmount : amount,
+            flowDirUV * splatForceScale
+        );
     }
 
+    /// <summary>
+    /// Clears all simulation buffers.
+    /// </summary>
     public void Clear()
     {
         ClearRT(velA); ClearRT(velB);
         ClearRT(dyeA); ClearRT(dyeB);
-        ClearRT(pA); ClearRT(pB);
+        ClearRT(pA);   ClearRT(pB);
         ClearRT(div);
+
         BindSurface();
     }
 
-    // ---------------- core loop ----------------
+    // ---------------- Simulation ----------------
 
+    /// <summary>
+    /// One simulation step:
+    /// 1) divergence
+    /// 2) pressure solve (Jacobi)
+    /// 3) projection (subtract gradient)
+    /// 4) advect velocity
+    /// 5) advect dye
+    /// </summary>
     void Step(float dtSec)
     {
-        int W = resolution, H = resolution;
-
         BindGlobals();
 
-        // Optional: diffuse velocity for thickness
-        if (velDiffuseIters > 0)
-        {
-            fluid.SetTexture(kDiffuseVel, "Vel0", velA);
-            for (int i = 0; i < velDiffuseIters; i++)
-            {
-                fluid.SetTexture(kDiffuseVel, "VelRead", velA);
-                fluid.SetTexture(kDiffuseVel, "VelWrite", velB);
-                Dispatch(kDiffuseVel, W, H); Swap(ref velA, ref velB);
-            }
-        }
-
-        // Project (divergence free)
+        // 1) Divergence
         fluid.SetTexture(kDiv, "VelRead", velA);
         fluid.SetTexture(kDiv, "Divergence", div);
-        Dispatch(kDiv, W, H);
+        Dispatch(kDiv);
 
-        // Jacobi on pressure
-        fluid.SetFloat(_jacobiAlpha, -1.0f);
-        fluid.SetFloat(_jacobiBeta, 4.0f);
-        ClearRT(pA); ClearRT(pB);
-        for (int i = 0; i < pressureIters; i++)
+        // 2) Pressure solve
+        if (pressureIters > 0)
         {
-            fluid.SetTexture(kJacobi, "PressureRead", pA);
-            fluid.SetTexture(kJacobi, "PressureWrite", pB);
-            fluid.SetTexture(kJacobi, "Divergence", div);
-            Dispatch(kJacobi, W, H); Swap(ref pA, ref pB);
+            ClearRT(pA);
+            ClearRT(pB);
+
+            for (int i = 0; i < pressureIters; i++)
+            {
+                fluid.SetTexture(kJacobi, "PressureRead", pA);
+                fluid.SetTexture(kJacobi, "PressureWrite", pB);
+                fluid.SetTexture(kJacobi, "Divergence", div);
+                Dispatch(kJacobi);
+                Swap(ref pA, ref pB);
+            }
+
+            // 3) Projection
+            fluid.SetTexture(kSubtract, "VelRead", velA);
+            fluid.SetTexture(kSubtract, "VelWrite", velB);
+            fluid.SetTexture(kSubtract, "PressureRead", pA);
+            Dispatch(kSubtract);
+            Swap(ref velA, ref velB);
         }
 
-        // Subtract gradient
-        fluid.SetTexture(kSubtract, "VelRead", velA);
-        fluid.SetTexture(kSubtract, "VelWrite", velB);
-        fluid.SetTexture(kSubtract, "PressureRead", pA);
-        Dispatch(kSubtract, W, H); Swap(ref velA, ref velB);
-
-        // Advect velocity (semi-Lagrangian)
+        // 4) Advect velocity
         fluid.SetTexture(kAdvect, "VelRead", velA);
         fluid.SetTexture(kAdvect, "VelWrite", velB);
-        Dispatch(kAdvect, W, H); Swap(ref velA, ref velB);
+        Dispatch(kAdvect);
+        Swap(ref velA, ref velB);
 
-        // Boundaries (simple zero border)
-        fluid.SetTexture(kBoundary, "VelWrite", velA);
-        fluid.SetTexture(kBoundary, "PressureWrite", pA);
-        Dispatch(kBoundary, W, H);
-
-        // Advect dye by velocity
+        // 5) Advect dye
         fluid.SetTexture(kAdvectDye, "VelRead", velA);
         fluid.SetTexture(kAdvectDye, "DyeRead", dyeA);
         fluid.SetTexture(kAdvectDye, "DyeWrite", dyeB);
-        Dispatch(kAdvectDye, W, H); Swap(ref dyeA, ref dyeB);
+        Dispatch(kAdvectDye);
+        Swap(ref dyeA, ref dyeB);
 
         BindSurface();
     }
 
+    /// <summary>
+    /// Writes into dye + velocity via the compute "Splat" kernel and ping-pongs buffers.
+    /// </summary>
     void Splat(Vector2 uv, float radius, float hardness, float amount, Vector2 force)
     {
-        int W = resolution, H = resolution;
         BindGlobals();
 
-        fluid.SetVector(_splatUV, new Vector4(uv.x, uv.y, 0, 0));
-        fluid.SetFloat(_splatRadius, Mathf.Max(0.0005f, radius));
-        fluid.SetFloat(_splatHardness, Mathf.Clamp01(hardness));
-        fluid.SetFloat(_splatAmount, Mathf.Clamp01(amount));
-        fluid.SetVector(_splatForce, new Vector4(force.x, force.y, 0, 0));
+        fluid.SetVector(ID_splatUV, new Vector4(uv.x, uv.y, 0f, 0f));
+        fluid.SetFloat(ID_splatRadius, Mathf.Max(0.0005f, radius));
+        fluid.SetFloat(ID_splatHardness, Mathf.Clamp01(hardness));
+        fluid.SetFloat(ID_splatAmount, Mathf.Clamp01(amount));
+        fluid.SetVector(ID_splatForce, new Vector4(force.x, force.y, 0f, 0f));
 
         fluid.SetTexture(kSplat, "VelRead", velA);
         fluid.SetTexture(kSplat, "VelWrite", velB);
         fluid.SetTexture(kSplat, "DyeRead", dyeA);
         fluid.SetTexture(kSplat, "DyeWrite", dyeB);
-        Dispatch(kSplat, W, H); Swap(ref velA, ref velB); Swap(ref dyeA, ref dyeB);
+
+        Dispatch(kSplat);
+
+        Swap(ref velA, ref velB);
+        Swap(ref dyeA, ref dyeB);
 
         BindSurface();
     }
 
-    // ---------------- setup / utils ----------------
+    // ---------------- Setup / Utilities ----------------
+
+    /// <summary>
+    /// Prevents large impulses from destabilizing the sim.
+    /// </summary>
+    Vector2 ClampForce(Vector2 v)
+    {
+        float maxSqr = forceMaxUVPerSec * forceMaxUVPerSec;
+        if (v.sqrMagnitude > maxSqr)
+            return v.normalized * forceMaxUVPerSec;
+        return v;
+    }
 
     void Allocate()
     {
         velA = MakeRT(RenderTextureFormat.RGFloat);
         velB = MakeRT(RenderTextureFormat.RGFloat);
 
-        // Dye: use ARGBHalf to guarantee UAV support on DX11
         dyeA = MakeRT(RenderTextureFormat.ARGBHalf);
         dyeB = MakeRT(RenderTextureFormat.ARGBHalf);
 
-        pA = MakeRT(RenderTextureFormat.RFloat);
-        pB = MakeRT(RenderTextureFormat.RFloat);
+        pA  = MakeRT(RenderTextureFormat.RFloat);
+        pB  = MakeRT(RenderTextureFormat.RFloat);
+
         div = MakeRT(RenderTextureFormat.RFloat);
 
         Clear();
-
-        // Useful one-time diagnostics
-        Debug.Log("supportsComputeShaders=" + SystemInfo.supportsComputeShaders);
-        Debug.Log("RW ARGB32=" + SystemInfo.SupportsRandomWriteOnRenderTextureFormat(RenderTextureFormat.ARGB32)
-                + " ARGBHalf=" + SystemInfo.SupportsRandomWriteOnRenderTextureFormat(RenderTextureFormat.ARGBHalf)
-                + " RGFloat=" + SystemInfo.SupportsRandomWriteOnRenderTextureFormat(RenderTextureFormat.RGFloat)
-                + " RFloat=" + SystemInfo.SupportsRandomWriteOnRenderTextureFormat(RenderTextureFormat.RFloat));
-        Debug.Log($"dyeA created: format={dyeA.format} randomWrite={dyeA.enableRandomWrite}");
     }
-
 
     RenderTexture MakeRT(RenderTextureFormat fmt)
     {
@@ -280,33 +287,42 @@ public class LatteSimCompute : MonoBehaviour
 
     void CacheKernels()
     {
-        kSplat = fluid.FindKernel("Splat");
-        kAdvect = fluid.FindKernel("Advect");
-        kAdvectDye = fluid.FindKernel("AdvectDye");
+        kSplat      = fluid.FindKernel("Splat");
+        kAdvect     = fluid.FindKernel("Advect");
+        kAdvectDye  = fluid.FindKernel("AdvectDye");
         kDiffuseVel = fluid.FindKernel("DiffuseVel");
-        kDiv = fluid.FindKernel("ComputeDiv");
-        kJacobi = fluid.FindKernel("JacobiPressure");
-        kSubtract = fluid.FindKernel("SubtractGrad");
-        kBoundary = fluid.FindKernel("Boundary");
+        kDiv        = fluid.FindKernel("ComputeDiv");
+        kJacobi     = fluid.FindKernel("JacobiPressure");
+        kSubtract   = fluid.FindKernel("SubtractGrad");
+        kBoundary   = fluid.FindKernel("Boundary");
 
         tgx = Mathf.CeilToInt(resolution / 8f);
         tgy = Mathf.CeilToInt(resolution / 8f);
     }
 
+    /// <summary>
+    /// Parameters shared by most kernels (set once per frame/dispatch).
+    /// </summary>
     void BindGlobals()
     {
-        fluid.SetVector(_GridSize, new Vector2(resolution, resolution));
-        fluid.SetFloat(_Texel, 1f / resolution);
-        fluid.SetFloat(_dt, Mathf.Max(1e-4f, timestep));
-        fluid.SetFloat(_viscosity, viscosity);
-        fluid.SetFloat(_dyeDiss, dyeDissipation);
+        fluid.SetVector(ID_GridSize, new Vector2(resolution, resolution));
+        fluid.SetFloat(ID_Texel, 1f / resolution);
+        fluid.SetFloat(ID_dt, Mathf.Max(1e-4f, timestep));
+        fluid.SetFloat(ID_viscosity, viscosity);
+        fluid.SetFloat(ID_dyeDiss, dyeDissipation);
     }
 
-    void Dispatch(int kernel, int W, int H) => fluid.Dispatch(kernel, tgx, tgy, 1);
+    void Dispatch(int kernel)
+    {
+        fluid.Dispatch(kernel, tgx, tgy, 1);
+    }
 
-    void Swap(ref RenderTexture a, ref RenderTexture b) { var t = a; a = b; b = t; }
+    static void Swap(ref RenderTexture a, ref RenderTexture b)
+    {
+        var t = a; a = b; b = t;
+    }
 
-    void ClearRT(RenderTexture rt)
+    static void ClearRT(RenderTexture rt)
     {
         var prev = RenderTexture.active;
         RenderTexture.active = rt;
@@ -314,26 +330,36 @@ public class LatteSimCompute : MonoBehaviour
         RenderTexture.active = prev;
     }
 
-    MaterialPropertyBlock _mpb;
-    void ApplyTexture(Renderer r, Texture t)
-    {
-        if (!r) return;
-        if (_mpb == null) _mpb = new MaterialPropertyBlock();
-        r.GetPropertyBlock(_mpb);
-        _mpb.SetTexture("_MainTex", t);
-        _mpb.SetTexture("_BaseMap", t);
-        r.SetPropertyBlock(_mpb);
-    }
+    /// <summary>
+    /// Applies the current dye texture to the visible surface (via MPB, no material instancing).
+    /// </summary>
     void BindSurface()
     {
         ApplyTexture(surfaceRenderer, dyeA);
         ApplyTexture(debugRenderer, dyeA);
     }
 
+    void ApplyTexture(Renderer r, Texture t)
+    {
+        if (!r) return;
+
+        _mpb ??= new MaterialPropertyBlock();
+        r.GetPropertyBlock(_mpb);
+        _mpb.SetTexture("_MainTex", t);
+        _mpb.SetTexture("_BaseMap", t);
+        r.SetPropertyBlock(_mpb);
+    }
 
     void ReleaseAll()
     {
-        foreach (var rt in new[] { velA, velB, dyeA, dyeB, pA, pB, div })
-            if (rt) rt.Release();
+        ReleaseRT(velA); ReleaseRT(velB);
+        ReleaseRT(dyeA); ReleaseRT(dyeB);
+        ReleaseRT(pA);   ReleaseRT(pB);
+        ReleaseRT(div);
+    }
+
+    static void ReleaseRT(RenderTexture rt)
+    {
+        if (rt) rt.Release();
     }
 }

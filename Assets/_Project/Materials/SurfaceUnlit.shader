@@ -2,57 +2,82 @@ Shader "Unlit/NewUnlitShader"
 {
     Properties
     {
-        _MainTex ("Texture", 2D) = "white" {}
+        _MainTex ("Dye (RWTexture)", 2D) = "white" {}
+        _CoffeeColor ("Coffee Color", Color) = (0.18, 0.10, 0.05, 1)
+        _MilkColor   ("Milk Color",   Color) = (0.98, 0.95, 0.90, 1)
+        _DepthStrength ("Depth Darkening", Range(0,1)) = 0.3
+        _MilkCurve   ("Milk Curve", Range(0.2,3)) = 1.5
     }
+
     SubShader
     {
-        Tags { "RenderType"="Opaque" }
+        Tags{"RenderType"="Opaque" "RenderPipeline"="UniversalPipeline"}
         LOD 100
 
         Pass
         {
-            CGPROGRAM
+            Name "Unlit"
+            Tags { "LightMode"="UniversalForward" }
+
+            HLSLPROGRAM
             #pragma vertex vert
             #pragma fragment frag
-            // make fog work
-            #pragma multi_compile_fog
+            #include "Packages/com.unity.render-pipelines.universal/ShaderLibrary/Core.hlsl"
 
-            #include "UnityCG.cginc"
-
-            struct appdata
+            struct Attributes
             {
-                float4 vertex : POSITION;
-                float2 uv : TEXCOORD0;
+                float4 positionOS : POSITION;
+                float2 uv         : TEXCOORD0;
             };
 
-            struct v2f
+            struct Varyings
             {
-                float2 uv : TEXCOORD0;
-                UNITY_FOG_COORDS(1)
-                float4 vertex : SV_POSITION;
+                float4 positionHCS : SV_POSITION;
+                float2 uv          : TEXCOORD0;
             };
 
-            sampler2D _MainTex;
+            TEXTURE2D(_MainTex); SAMPLER(sampler_MainTex);
             float4 _MainTex_ST;
 
-            v2f vert (appdata v)
+            float4 _CoffeeColor;
+            float4 _MilkColor;
+            float  _DepthStrength;
+            float  _MilkCurve;
+
+            Varyings vert(Attributes IN)
             {
-                v2f o;
-                o.vertex = UnityObjectToClipPos(v.vertex);
-                o.uv = TRANSFORM_TEX(v.uv, _MainTex);
-                UNITY_TRANSFER_FOG(o,o.vertex);
+                Varyings o;
+                o.positionHCS = TransformObjectToHClip(IN.positionOS.xyz);
+                o.uv = TRANSFORM_TEX(IN.uv, _MainTex);
                 return o;
             }
 
-            fixed4 frag (v2f i) : SV_Target
+            half4 frag(Varyings i) : SV_Target
             {
-                // sample the texture
-                fixed4 col = tex2D(_MainTex, i.uv);
-                // apply fog
-                UNITY_APPLY_FOG(i.fogCoord, col);
-                return col;
+                float2 uv = i.uv;
+                float  dye = SAMPLE_TEXTURE2D(_MainTex, sampler_MainTex, uv).r;
+
+                // Map dye -> milk amount (curved)
+                float milk = saturate(dye);
+                milk = pow(milk, _MilkCurve);
+
+                float3 coffee = _CoffeeColor.rgb;
+                float3 milkCol = _MilkColor.rgb;
+                float3 baseCol = lerp(coffee, milkCol, milk);
+
+                // radial depth darkening
+                float2 center = float2(0.5, 0.5);
+                float  r = distance(uv, center);
+                float  depth = saturate(r / 0.5);
+                float  depthTint = lerp(1.0, 1.0 - _DepthStrength, depth);
+
+                // milk on top cancels some depth darkening
+                depthTint = lerp(depthTint, 1.0, milk);
+                baseCol *= depthTint;
+
+                return float4(baseCol, 1.0);
             }
-            ENDCG
+            ENDHLSL
         }
     }
 }
